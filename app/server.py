@@ -13,6 +13,7 @@ from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
 from langchain.pydantic_v1 import BaseModel
 from typing import Any
+from langchain.agents.format_scratchpad import format_to_openai_functions
 
 from langserve import add_routes
 
@@ -54,6 +55,9 @@ add_routes(
 
 # Agent
 # -----
+# Input Schema: {"title":"Input","type":"object","properties":{"input":{"title":"Input","type":"string"}},"required":["input"]}
+# - requests.post("http://localhost:8000/invoke", json={"input": {"input": "what does eugene think of cats?"}})
+# - remote_runnable.invoke({"input": "what does eugene think of cats?"})
 @tool
 def get_eugene_thoughts(query: str) -> list:
     """Returns Eugene's thoughts on a topic."""
@@ -96,10 +100,6 @@ add_routes(
     path="/agent",
 )
 
-@tool
-def get_eugene_thoughts(query: str) -> list:
-    """Returns Eugene's thoughts on a topic."""
-    return retriever.get_relevant_documents(query)
 
 if __name__ == "__main__":
     import uvicorn
