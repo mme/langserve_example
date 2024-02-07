@@ -1,22 +1,18 @@
 #!/usr/bin/env python
-"""Example of configurable runnables.
-
-This example shows how to use two options for configuration of runnables:
-
-1) Configurable Fields: Use this to specify values for a given initialization parameter
-2) Configurable Alternatives: Use this to specify complete alternative runnables
-"""
+"""Example LangChain server exposes multiple runnables (LLMs in this case)."""
 from dotenv import load_dotenv
 load_dotenv()
 
-from typing import Any, Dict
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 from langchain.chat_models import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain.schema.output_parser import StrOutputParser
-from langchain.schema.runnable import ConfigurableField
+from langchain.vectorstores import FAISS
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.agents import AgentExecutor, tool
+from langchain.tools.render import format_tool_to_openai_function
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
+from langchain.pydantic_v1 import BaseModel
+from typing import Any
 
 from langserve import add_routes
 
@@ -26,100 +22,84 @@ app = FastAPI(
     description="Spin up a simple api server using Langchain's Runnable interfaces",
 )
 
-# Set all CORS enabled origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+# ChatOpenAI
+# ----------
+# We probably can't support ChatOpenAI...
+# see input schema: http://localhost:8000/openai/input_schema
+# also playground: http://localhost:8000/openai/playground/
+# it looks tricky to support this in a generic way
+add_routes(
+    app,
+    ChatOpenAI(),
+    path="/openai",
 )
 
-###############################################################################
-#                EXAMPLE 1: Configure fields based on RunnableConfig          #
-###############################################################################
-model = ChatOpenAI(temperature=0.5).configurable_alternatives(
-    ConfigurableField(
-        id="llm",
-        name="LLM",
-        description=(
-            "Decide whether to use a high or a low temperature parameter for the LLM."
+# Retriever
+# ---------
+# receives a single input VectorStoreRetrieverInput (type string)
+# Input Schema: {"title":"VectorStoreRetrieverInput","type":"string"}
+# according to the client docs, it can be called like this:
+# - requests.post("http://localhost:8000/invoke", json={"input": "tree"})
+# - remote_runnable.invoke("tree")
+vectorstore = FAISS.from_texts(
+    ["cats like fish", "dogs like sticks"], embedding=OpenAIEmbeddings()
+)
+retriever = vectorstore.as_retriever()
+
+add_routes(
+    app, 
+    retriever,
+    path="/retriever",
+)
+
+# Agent
+# -----
+@tool
+def get_eugene_thoughts(query: str) -> list:
+    """Returns Eugene's thoughts on a topic."""
+    return retriever.get_relevant_documents(query)
+
+tools = [get_eugene_thoughts]
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, streaming=True)
+llm_with_tools = llm.bind(functions=[format_tool_to_openai_function(t) for t in tools])
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a helpful assistant."),
+        ("user", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ]
+)
+agent = (
+    {
+        "input": lambda x: x["input"],
+        "agent_scratchpad": lambda x: format_to_openai_functions(
+            x["intermediate_steps"]
         ),
-    ),
-    high_temp=ChatOpenAI(temperature=0.9),
-    low_temp=ChatOpenAI(temperature=0.1),
-    default_key="medium_temp",
+    }
+    | prompt
+    | llm_with_tools
+    | OpenAIFunctionsAgentOutputParser()
 )
-prompt = PromptTemplate.from_template(
-    "tell me a joke about {topic}."
-).configurable_fields(  # Example of a configurable field
-    template=ConfigurableField(
-        id="prompt",
-        name="Prompt",
-        description="The prompt to use. Must contain {topic}.",
-    )
-)
-chain = prompt | model | StrOutputParser()
+agent_executor = AgentExecutor(agent=agent, tools=tools)
 
-add_routes(app, chain, path="/configurable_temp")
+class Input(BaseModel):
+    input: str
 
-
-###############################################################################
-#                EXAMPLE 2: Configure prompt based on RunnableConfig          #
-###############################################################################
-configurable_prompt = PromptTemplate.from_template(
-    "tell me a joke about {topic}."
-).configurable_alternatives(
-    ConfigurableField(
-        id="prompt",
-        name="Prompt",
-        description="The prompt to use. Must contain {topic}.",
-    ),
-    default_key="joke",
-    fact=PromptTemplate.from_template(
-        "tell me a fact about {topic} in {language} language."
-    ),
-)
-prompt_chain = configurable_prompt | model | StrOutputParser()
-
-add_routes(app, prompt_chain, path="/configurable_prompt")
-
-
-###############################################################################
-#             EXAMPLE 3: Configure fields based on Request metadata           #
-###############################################################################
-
-
-# Add another example route where you can configure the model based
-# on properties of the request. This is useful for passing in API
-# keys from request headers (WITH CAUTION) or using other properties
-# of the request to configure the model.
-def fetch_api_key_from_header(config: Dict[str, Any], req: Request) -> Dict[str, Any]:
-    if "x-api-key" in req.headers:
-        config["configurable"]["openai_api_key"] = req.headers["x-api-key"]
-    else:
-        raise HTTPException(401, "No API key provided")
-
-    return config
-
-
-dynamic_auth_model = ChatOpenAI(openai_api_key="placeholder").configurable_fields(
-    openai_api_key=ConfigurableField(
-        id="openai_api_key",
-        name="OpenAI API Key",
-        description=("API Key for OpenAI interactions"),
-    ),
-)
-
-dynamic_auth_chain = dynamic_auth_model | StrOutputParser()
+class Output(BaseModel):
+    output: Any
 
 add_routes(
     app,
-    dynamic_auth_chain,
-    path="/auth_from_header",
-    per_req_config_modifier=fetch_api_key_from_header,
+    agent_executor.with_types(input_type=Input, output_type=Output).with_config(
+        {"run_name": "agent"}
+    ),
+    path="/agent",
 )
+
+@tool
+def get_eugene_thoughts(query: str) -> list:
+    """Returns Eugene's thoughts on a topic."""
+    return retriever.get_relevant_documents(query)
 
 if __name__ == "__main__":
     import uvicorn
