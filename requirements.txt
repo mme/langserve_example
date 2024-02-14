@@ -21,7 +21,6 @@ build==0.10.0
 CacheControl==0.13.1
 cachetools==5.3.1
 certifi==2024.2.2
-cffi @ file:///private/tmp/cffi-20230928-4749-xd5bq7/cffi-1.16.0
 chardet==5.1.0
 charset-normalizer==3.3.2
 click==8.1.7
